@@ -34,5 +34,5 @@ python run_trainer.py
 ```
 ### 2.2预期结果
 预期结果如下：
-![](Figures/imagenet.png)
-![](Figures/resnet-cub.png)
+![]()
+![]()
