@@ -3,20 +3,21 @@ includes:
   - headers/device.yaml
   - headers/model.yaml
   - headers/optimizer.yaml
- #- backbones/WRN.yaml #如果想使用WRN基座，请取消这部分的注释
+  #- backbones/WRN.yaml #如果想使用WRN基座，请取消这部分的注释
 realistic_transductive:
   enable: true
-  k_way: 64        # 支持集总类别数
+  sampling: uniform  # 查询集采样方式: 'uniform'(真实分布) 或 'balanced'(平衡分布)
+  k_way: -1        # 支持集总类别数
   k_eff: 5         # 查询集有效类别数
   n_shot: 5        # 每类支持样本数
   q_total: 75      # 查询集总样本数
 
-  val_k_way: 16
+  val_k_way: -1
   val_k_eff: 5
   val_n_shot: 5
   val_q_total: 75
 
-  test_k_way: 20
+  test_k_way: -1
   test_k_eff: 5
   test_n_shot: 5
   test_q_total: 75
@@ -34,24 +35,21 @@ backbone:
   kwargs:
     is_feature: False #如果想使用WRN基座，请注释掉backbone部分
 
-feature_save_dir: "/path/to/save/featues"
-
-pretrain_path: "/path/to/your/pretrain/model"
+pretrain_path: "D:/Downloads/models/models/cub/softmax/resnet18/model_best.pth.tar"
 
 optimizer:
   name: Adam
   kwargs:
     lr: 0.1
-    weight_decay: 0.0005
 
 lr_scheduler:
   name: StepLR
   kwargs:
     gamma: 0.5
-    step_size: 20
+    step_size: 10
 
-epoch: 80
-episode_size: 1
+epoch: 20
+episode_size: 200
 train_episode: 1000
 test_episode: 1000
 

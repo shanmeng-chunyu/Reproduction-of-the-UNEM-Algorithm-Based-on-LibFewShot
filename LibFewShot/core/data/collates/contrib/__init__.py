@@ -67,12 +67,18 @@ def get_augment_method(
                 transforms.RandomHorizontalFlip(),
                 transforms.ColorJitter(**CJ_DICT),
             ]
+        elif config["augment_method"] == "CUBAugment":
+            trfms_list = [
+                transforms.RandomResizedCrop(config["image_size"]),
+                transforms.RandomHorizontalFlip(),
+            ]
         else:
             trfms_list = get_default_image_size_trfms(config["image_size"])
             trfms_list += [
                 transforms.ColorJitter(**CJ_DICT),
                 transforms.RandomHorizontalFlip(),
             ]
+
             
     else:
         if config["image_size"] == 224:
@@ -147,4 +153,7 @@ def get_mean_std(
     elif config["augment_method"]== "S2M2Augment":
         MEAN= [0.485, 0.456, 0.406]
         STD=[0.229, 0.224, 0.225]
+    elif config["augment_method"] == "CUBAugment":
+        MEAN = [0.485, 0.456, 0.406]
+        STD = [0.229, 0.224, 0.225]
     return MEAN,STD

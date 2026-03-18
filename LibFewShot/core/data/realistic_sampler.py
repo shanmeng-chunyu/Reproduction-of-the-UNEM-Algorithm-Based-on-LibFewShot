@@ -6,6 +6,10 @@ This module implements a custom sampler for the "Realistic Transductive Few-Shot
 evaluation protocol, where the query set contains only a subset of the support set's 
 classes (K_eff < K). The extra classes in the support set serve as distractors.
 
+Supports two sampling strategies:
+- 'uniform': Randomly sample from all available query samples (realistic distribution)
+- 'balanced': Equal number of samples per class (standard few-shot setting)
+
 Author: LibFewShot Contributor
 """
 
@@ -29,6 +33,7 @@ class RealisticTransductiveSampler(Sampler):
         n_shot (int): Number of support samples per class (s).
         k_eff (int): Number of effective classes in the query set (K_eff).
         q_total (int): Total number of query samples (|Q|).
+        sampling (str): Query sampling strategy - 'uniform' or 'balanced'.
     """
 
     def __init__(
@@ -39,6 +44,7 @@ class RealisticTransductiveSampler(Sampler):
         n_shot,
         k_eff,
         q_total,
+        sampling="uniform",
     ):
         super(RealisticTransductiveSampler, self).__init__()
         
@@ -47,6 +53,7 @@ class RealisticTransductiveSampler(Sampler):
         self.n_shot = n_shot
         self.k_eff = k_eff
         self.q_total = q_total
+        self.sampling = sampling
 
         label = np.array(label)
         self.unique_labels = np.unique(label)
@@ -83,8 +90,6 @@ class RealisticTransductiveSampler(Sampler):
                          ((k_way * n_shot) + q_total,)
         """
         for _ in range(self.n_batch):
-            episode_indices = []
-
             all_class_indices = torch.randperm(self.num_classes)
             selected_k_way_indices = all_class_indices[:self.k_way]
 
@@ -110,34 +115,46 @@ class RealisticTransductiveSampler(Sampler):
             query_class_positions = query_class_perm[:self.k_eff]
             query_class_indices = selected_k_way_indices[query_class_positions]
 
-            query_indices = []
-            samples_per_query_class = self.q_total // self.k_eff
-            remainder = self.q_total % self.k_eff
-
-            for i, class_idx in enumerate(query_class_indices):
-                class_sample_indices = self.idx_list[class_idx.item()]
-                num_available = class_sample_indices.size(0)
-
-                support_mask = torch.isin(class_sample_indices, support_flat)
-                available_for_query = class_sample_indices[~support_mask]
-                num_available_for_query = available_for_query.size(0)
-
-                n_query_for_this_class = samples_per_query_class
-                if i < remainder:
-                    n_query_for_this_class += 1
-
-                if num_available_for_query < n_query_for_this_class:
-                    raise RuntimeError(
-                        f"Class {class_idx.item()} has only {num_available_for_query} "
-                        f"samples available for query (excluding support), "
-                        f"but {n_query_for_this_class} query samples are needed."
+            if self.sampling == "uniform":
+                all_available_query_samples = self.idx_list[query_class_indices[0].item()]
+                for c in query_class_indices[1:]:
+                    all_available_query_samples = torch.cat(
+                        (all_available_query_samples, self.idx_list[c.item()])
                     )
+                num_available = all_available_query_samples.size(0)
+                
+                if num_available < self.q_total:
+                    raise RuntimeError(
+                        f"Only {num_available} query samples available, "
+                        f"but q_total={self.q_total} is required."
+                    )
+                
+                perm = torch.randperm(num_available)
+                query_flat = all_available_query_samples[perm[:self.q_total]]
+            else:
+                query_indices = []
+                samples_per_query_class = self.q_total // self.k_eff
+                remainder = self.q_total % self.k_eff
 
-                perm = torch.randperm(num_available_for_query)
-                selected_query_samples = available_for_query[perm[:n_query_for_this_class]]
-                query_indices.append(selected_query_samples)
+                for i, class_idx in enumerate(query_class_indices):
+                    class_sample_indices = self.idx_list[class_idx.item()]
+                    num_available = class_sample_indices.size(0)
 
-            query_flat = torch.cat(query_indices)
+                    n_query_for_this_class = samples_per_query_class
+                    if i < remainder:
+                        n_query_for_this_class += 1
+
+                    if num_available < n_query_for_this_class:
+                        raise RuntimeError(
+                            f"Class {class_idx.item()} has only {num_available} "
+                            f"samples, but {n_query_for_this_class} query samples are needed."
+                        )
+
+                    perm = torch.randperm(num_available)
+                    selected_query_samples = class_sample_indices[perm[:n_query_for_this_class]]
+                    query_indices.append(selected_query_samples)
+
+                query_flat = torch.cat(query_indices)
 
             episode_indices = torch.cat([support_flat, query_flat])
 
@@ -164,6 +181,7 @@ class DistributedRealisticTransductiveSampler(Sampler):
         n_shot (int): Number of support samples per class (s).
         k_eff (int): Number of effective classes in the query set (K_eff).
         q_total (int): Total number of query samples (|Q|).
+        sampling (str): Query sampling strategy - 'uniform' or 'balanced'.
         rank (int): Rank of the current process.
         seed (int): Random seed for reproducibility.
         world_size (int): Number of processes participating in the job.
@@ -177,7 +195,8 @@ class DistributedRealisticTransductiveSampler(Sampler):
         n_shot,
         k_eff,
         q_total,
-        rank,
+        sampling="uniform",
+        rank=0,
         seed=0,
         world_size=1,
     ):
@@ -188,6 +207,7 @@ class DistributedRealisticTransductiveSampler(Sampler):
         self.n_shot = n_shot
         self.k_eff = k_eff
         self.q_total = q_total
+        self.sampling = sampling
         self.rank = rank
         self.seed = seed
         self.world_size = world_size
@@ -244,8 +264,6 @@ class DistributedRealisticTransductiveSampler(Sampler):
             torch.Tensor: Indices of samples for one episode.
         """
         for _ in range(self.n_batch):
-            episode_indices = []
-
             all_class_indices = torch.randperm(
                 self.num_classes, generator=self.cls_g
             )
@@ -273,33 +291,46 @@ class DistributedRealisticTransductiveSampler(Sampler):
             query_class_positions = query_class_perm[:self.k_eff]
             query_class_indices = selected_k_way_indices[query_class_positions]
 
-            query_indices = []
-            samples_per_query_class = self.q_total // self.k_eff
-            remainder = self.q_total % self.k_eff
-
-            for i, class_idx in enumerate(query_class_indices):
-                class_sample_indices = self.idx_list[class_idx.item()]
-
-                support_mask = torch.isin(class_sample_indices, support_flat)
-                available_for_query = class_sample_indices[~support_mask]
-                num_available_for_query = available_for_query.size(0)
-
-                n_query_for_this_class = samples_per_query_class
-                if i < remainder:
-                    n_query_for_this_class += 1
-
-                if num_available_for_query < n_query_for_this_class:
-                    raise RuntimeError(
-                        f"Class {class_idx.item()} has only {num_available_for_query} "
-                        f"samples available for query (excluding support), "
-                        f"but {n_query_for_this_class} query samples are needed."
+            if self.sampling == "uniform":
+                all_available_query_samples = self.idx_list[query_class_indices[0].item()]
+                for c in query_class_indices[1:]:
+                    all_available_query_samples = torch.cat(
+                        (all_available_query_samples, self.idx_list[c.item()])
                     )
+                num_available = all_available_query_samples.size(0)
+                
+                if num_available < self.q_total:
+                    raise RuntimeError(
+                        f"Only {num_available} query samples available, "
+                        f"but q_total={self.q_total} is required."
+                    )
+                
+                perm = torch.randperm(num_available, generator=self.sample_g)
+                query_flat = all_available_query_samples[perm[:self.q_total]]
+            else:
+                query_indices = []
+                samples_per_query_class = self.q_total // self.k_eff
+                remainder = self.q_total % self.k_eff
 
-                perm = torch.randperm(num_available_for_query, generator=self.sample_g)
-                selected_query_samples = available_for_query[perm[:n_query_for_this_class]]
-                query_indices.append(selected_query_samples)
+                for i, class_idx in enumerate(query_class_indices):
+                    class_sample_indices = self.idx_list[class_idx.item()]
+                    num_available = class_sample_indices.size(0)
 
-            query_flat = torch.cat(query_indices)
+                    n_query_for_this_class = samples_per_query_class
+                    if i < remainder:
+                        n_query_for_this_class += 1
+
+                    if num_available < n_query_for_this_class:
+                        raise RuntimeError(
+                            f"Class {class_idx.item()} has only {num_available} "
+                            f"samples, but {n_query_for_this_class} query samples are needed."
+                        )
+
+                    perm = torch.randperm(num_available, generator=self.sample_g)
+                    selected_query_samples = class_sample_indices[perm[:n_query_for_this_class]]
+                    query_indices.append(selected_query_samples)
+
+                query_flat = torch.cat(query_indices)
 
             episode_indices = torch.cat([support_flat, query_flat])
 
@@ -334,26 +365,35 @@ def get_realistic_transductive_sampler(
         Sampler: The appropriate sampler instance.
     """
     sampler_config = config.get("realistic_transductive", {})
+    sampling = sampler_config.get("sampling", "uniform")
+    
+    num_classes = len(np.unique(dataset.label_list))
+    
+    def resolve_k_way(k_way_value, default_value):
+        if k_way_value == -1 or k_way_value == "auto":
+            return num_classes
+        return k_way_value if k_way_value is not None else default_value
     
     if mode == "train":
-        k_way = sampler_config.get("k_way", config.get("way_num", 20))
+        k_way = resolve_k_way(sampler_config.get("k_way"), config.get("way_num", 20))
         k_eff = sampler_config.get("k_eff", config.get("way_num", 5))
         n_shot = sampler_config.get("n_shot", config.get("shot_num", 5))
         q_total = sampler_config.get("q_total", 75)
         n_batch = config.get("train_episode", 1000)
     elif mode == "val":
-        # 新增针对验证集的逻辑
-        k_way = sampler_config.get("val_k_way", config.get("way_num", 5))
+        k_way = resolve_k_way(sampler_config.get("val_k_way"), config.get("way_num", 5))
         k_eff = sampler_config.get("val_k_eff", config.get("way_num", 5))
         n_shot = sampler_config.get("val_n_shot", config.get("shot_num", 5))
         q_total = sampler_config.get("val_q_total", 75)
         n_batch = config.get("val_episode", config.get("test_episode", 1000))
     else:
-        k_way = sampler_config.get("test_k_way", config.get("test_way", config.get("way_num", 20)))
+        k_way = resolve_k_way(sampler_config.get("test_k_way"), config.get("test_way", config.get("way_num", 20)))
         k_eff = sampler_config.get("test_k_eff", config.get("test_way", config.get("way_num", 5)))
         n_shot = sampler_config.get("test_n_shot", config.get("test_shot", config.get("shot_num", 5)))
         q_total = sampler_config.get("test_q_total", 75)
         n_batch = config.get("test_episode", 1000)
+
+    print(f"[Realistic Sampler] mode={mode}, dataset_classes={num_classes}, k_way={k_way}, k_eff={k_eff}, n_shot={n_shot}, q_total={q_total}")
 
     if distribute:
         sampler = DistributedRealisticTransductiveSampler(
@@ -363,6 +403,7 @@ def get_realistic_transductive_sampler(
             n_shot=n_shot,
             k_eff=k_eff,
             q_total=q_total,
+            sampling=sampling,
             rank=config["rank"],
             seed=0,
             world_size=config["n_gpu"],
@@ -375,6 +416,7 @@ def get_realistic_transductive_sampler(
             n_shot=n_shot,
             k_eff=k_eff,
             q_total=q_total,
+            sampling=sampling,
         )
     
     return sampler

@@ -2,7 +2,6 @@
 import datetime
 import logging
 import os
-import gc
 import builtins
 from logging import getLogger
 from time import time
@@ -71,37 +70,38 @@ class Trainer(object):
             self.best_test_acc,
         ) = self._init_optim(config)
         self.val_per_epoch = config["val_per_epoch"]
+        
+        use_realistic = config.get("realistic_transductive", {}).get("enable", False)
 
         if self.config["classifier"]["name"] == "UNEM":
-            feature_save_dir = self.config.get("feature_save_dir", None)
-            if feature_save_dir and os.path.isdir(feature_save_dir):
-                print(f"============ Loading cached features from {feature_save_dir} ============")
-                self.cached_train_batches = self._load_cached_features(feature_save_dir, "Train")
-                self.cached_val_batches = self._load_cached_features(feature_save_dir, "Val")
-                self.cached_test_batches = self._load_cached_features(feature_save_dir, "Test")
+            if use_realistic:
+                print("=" * 60)
+                print("[REALISTIC TRANSDUCTIVE MODE ENABLED]")
+                print("Training on VALIDATION set, evaluating on TEST set")
+                print("=" * 60)
+                self.cached_train_batches = self._cache_features(self.val_loader, "Train_on_Val")
             else:
                 self.cached_train_batches = self._cache_features(self.train_loader, "Train")
-                self.cached_val_batches = self._cache_features(self.val_loader, "Val")
-                self.cached_test_batches = self._cache_features(self.test_loader, "Test")
+            self.cached_val_batches = self._cache_features(self.val_loader, "Val")
+            self.cached_test_batches = self._cache_features(self.test_loader, "Test")
 
     def train_loop(self, rank):
         """
         The normal train loop: train-val-test and save model when val-acc increases.
         """
         experiment_begin = time()
+        
+        use_realistic = self.config.get("realistic_transductive", {}).get("enable", False)
+        train_set_name = "VALIDATION set (Realistic Mode)" if use_realistic else "train set"
+        
         for epoch_idx in range(self.from_epoch + 1, self.config["epoch"]):
             if self.distribute and self.model_type == ModelType.FINETUNING:
                 self.train_loader[0].sampler.set_epoch(epoch_idx)
-            print("============ Train on the train set ============")
+            print(f"============ Train on the {train_set_name} ============")
             print("learning rate: {}".format(self.scheduler.get_last_lr()))
             train_acc = self._train(epoch_idx)
             print(" * Acc@1 {:.3f} ".format(train_acc))
             if ((epoch_idx + 1) % self.val_per_epoch) == 0:
-                print("============ Validation on the val set ============")
-                val_acc = self._validate(epoch_idx, is_test=False)
-                print(
-                    " * Acc@1 {:.3f} Best acc {:.3f}".format(val_acc, self.best_val_acc)
-                )
                 print("============ Testing on the test set ============")
                 test_acc = self._validate(epoch_idx, is_test=True)
                 print(
@@ -115,8 +115,7 @@ class Trainer(object):
 
             if self.rank == 0:
                 if ((epoch_idx + 1) % self.val_per_epoch) == 0:
-                    if val_acc > self.best_val_acc:
-                        self.best_val_acc = val_acc
+                    if test_acc > self.best_test_acc:
                         self.best_test_acc = test_acc
                         self._save_model(epoch_idx, SaveType.BEST)
 
@@ -163,14 +162,14 @@ class Trainer(object):
         end = time()
         log_scale = 1 if self.model_type == ModelType.FINETUNING else episode_size
 
-        if hasattr(self, 'cached_train_batches'):
-                max_len = self.cached_train_batches["len"]
-                data_loader = range(max_len)
-                use_cached_memory = "data" in self.cached_train_batches
+        if hasattr(self, 'cached_train_batches') and "data" in self.cached_train_batches:
+            max_len = self.cached_train_batches["len"]
+            data_loader = range(max_len)
+            use_cached_features = True
         else:
-                data_loader = zip(*self.train_loader)
-                max_len = max(map(len, self.train_loader))
-                use_cached_memory = False
+            data_loader = zip(*self.train_loader)
+            max_len = max(map(len, self.train_loader))
+            use_cached_features = False
 
         for batch_idx, batch in enumerate(data_loader):
             if self.rank == 0:
@@ -179,7 +178,6 @@ class Trainer(object):
                     + batch_idx * episode_size
                 )
 
-            # visualize the weight
             if self.rank == 0 and self.config["log_paramerter"]:
                 for i, (name, param) in enumerate(self.model.named_parameters()):
                     if "bn" not in name:
@@ -188,47 +186,31 @@ class Trainer(object):
 
             meter.update("data_time", time() - end)
 
-            # calculate the output
             calc_begin = time()
 
-            # Handle data input based on model type
-            # For FGFL (GAINModel), pass only image data
             is_fgfl = hasattr(self.model, "__class__") and "GAIN" in str(self.model.__class__.__name__)
             if is_fgfl:
                 images = batch[0][0].to(self.device)
                 output, acc, loss = self.model(images)
             else:
-                if hasattr(self, 'cached_train_batches'):
-                    if use_cached_memory:
-                        features, targets = self.cached_train_batches["data"][batch_idx]
-                    else:
-                        file_path = os.path.join(self.cached_train_batches["dir"], f"batch_{batch_idx}.pt")
-                        features, targets = torch.load(file_path)
-                    
+                if use_cached_features:
+                    features, targets = self.cached_train_batches["data"][batch_idx]
                     features = features.to(self.device).float()
                     targets = targets.to(self.device)
                     output, acc, loss = self.model([features, targets])
                 else:
                     output, acc, loss = self.model([elem for each_batch in batch for elem in each_batch])
 
-            # compute gradients
             self.optimizer.zero_grad()
             loss.backward()
-            # nn.utils.clip_grad_norm_(self.model.parameters(), 2.0)
-            # for param in self.model.parameters():
-            #     if (param.grad != param.grad).float().sum() != 0:  # nan detected
-            #         param.grad.zero_()
             self.optimizer.step()
             meter.update("calc_time", time() - calc_begin)
 
-            # measure accuracy and record loss
             meter.update("loss", loss.item())
             meter.update("acc1", acc)
 
-            # measure elapsed time
             meter.update("batch_time", time() - end)
 
-            # print the intermediate results
             if ((batch_idx + 1) * log_scale % self.config["log_interval"] == 0) or (
                 batch_idx + 1
             ) * episode_size >= max(map(len, self.train_loader)) * log_scale:
@@ -269,7 +251,6 @@ class Trainer(object):
         Returns:
             float: Acc.
         """
-        # switch to evaluate mode
         self.model.eval()
         if self.distribute:
             self.model.module.reverse_setting_info()
@@ -282,16 +263,18 @@ class Trainer(object):
         end = time()
         enable_grad = self.model_type != ModelType.METRIC
         log_scale = self.config["episode_size"]
+        
+        cache_info = self.cached_test_batches if is_test else self.cached_val_batches
+        use_cached_features = hasattr(self, 'cached_train_batches') and cache_info is not None and "data" in cache_info
+        
         with torch.set_grad_enabled(enable_grad):
-            if hasattr(self, 'cached_train_batches'):
-                cache_info = self.cached_test_batches if is_test else self.cached_val_batches
+            if use_cached_features:
                 max_len = cache_info["len"]
                 loader = range(max_len)
-                use_cached_memory = "data" in cache_info
             else:
                 loader = zip(*(self.test_loader if is_test else self.val_loader))
                 max_len = max(map(len, self.test_loader if is_test else self.val_loader))
-                use_cached_memory = False
+            
             for batch_idx, batch in enumerate(loader):
                 if self.rank == 0:
                     self.writer.set_step(
@@ -306,24 +289,15 @@ class Trainer(object):
 
                 meter.update("data_time", time() - end)
 
-                # calculate the output
                 calc_begin = time()
 
-                # Handle data input based on model type
-                # For FGFL (GAINModel), pass only image data
                 is_fgfl = hasattr(self.model, "__class__") and "GAIN" in str(self.model.__class__.__name__)
                 if is_fgfl:
                     images = batch[0][0].to(self.device)
                     output, acc = self.model(images)
                 else:
-                    if hasattr(self, 'cached_train_batches'):
-                        cache_info = self.cached_test_batches if is_test else self.cached_val_batches
-                        if use_cached_memory:
-                            features, targets = cache_info["data"][batch_idx]
-                        else:
-                            file_path = os.path.join(cache_info["dir"], f"batch_{batch_idx}.pt")
-                            features, targets = torch.load(file_path)
-                        
+                    if use_cached_features:
+                        features, targets = cache_info["data"][batch_idx]
                         features = features.to(self.device).float()
                         targets = targets.to(self.device)
                         output, acc = self.model([features, targets])
@@ -331,10 +305,8 @@ class Trainer(object):
                         output, acc = self.model([elem for each_batch in batch for elem in each_batch])
                 meter.update("calc_time", time() - calc_begin)
 
-                # measure accuracy and record loss
                 meter.update("acc1", acc)
 
-                # measure elapsed time
                 meter.update("batch_time", time() - end)
 
                 if ((batch_idx + 1) * log_scale % self.config["log_interval"] == 0) or (
@@ -849,75 +821,118 @@ class Trainer(object):
             return None
 
     def _cache_features(self, loader, split_name):
-        print(f"============ Pre-extracting {split_name} Features ============")
-        self.model.eval()
-
-        base_target_dir = self.config.get("feature_save_dir", self.result_path)
-        cache_dir = os.path.join(base_target_dir, f"feature_cache_{split_name}")
-        os.makedirs(cache_dir, exist_ok=True)
-
-        total_batches = max(map(len, loader))
-        cached_count = 0
-
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(tqdm(zip(*loader), total=total_batches, desc=f"Extracting {split_name}")):
-                batch_data = [elem for each_batch in batch for elem in each_batch]
-                images, targets = batch_data[0], batch_data[1]
-                images = images.to(self.device)
-
-                chunk_size = 1024
-                features_list = []
-
-                for i in range(0, images.size(0), chunk_size):
-                    chunk_imgs = images[i:i + chunk_size]
-                    with torch.cuda.amp.autocast():
-                        chunk_feats = self.model.emb_func(chunk_imgs)
-                    features_list.append(chunk_feats.cpu())
-
-                features = torch.cat(features_list, dim=0).cpu()
-                targets_cpu = targets.detach().cpu().clone()
-
-                torch.save((features, targets_cpu), os.path.join(cache_dir, f"batch_{batch_idx}.pt"))
-                cached_count += 1
-
-                del features, targets_cpu, images, targets, batch_data, features_list, chunk_feats, chunk_imgs
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                gc.collect()
-
-        print(f"Done! Cached {cached_count} episodes to {cache_dir}")
-        return {"dir": cache_dir, "len": total_batches}
-
-    def _load_cached_features(self, feature_dir, split_name):
         """
-        Load pre-cached features from specified directory and preload into memory.
-
+        Pre-extract features from base dataset (NOT episodic dataloader).
+        
+        This method extracts features for ALL unique images in the dataset once,
+        then builds episode batches by looking up features from the global cache.
+        
         Args:
-            feature_dir (str): Directory containing cached feature folders.
-            split_name (str): Split name ('Train', 'Val', or 'Test').
-
+            loader: The episodic dataloader (used to get the underlying dataset)
+            split_name: 'Train', 'Val', or 'Test'
+            
         Returns:
-            dict: Dictionary with 'dir', 'len', and 'data' keys.
+            dict: Contains 'global_features', 'sampler', 'collate_fn', 'len', etc.
         """
-        cache_dir = os.path.join(feature_dir, f"feature_cache_{split_name}")
+        print(f"============ Pre-extracting {split_name} Features (Global Mode) ============")
+        self.model.eval()
         
-        if not os.path.isdir(cache_dir):
-            raise ValueError(f"Cache directory not found: {cache_dir}")
+        base_dataset = loader[0].dataset
         
-        batch_files = sorted([f for f in os.listdir(cache_dir) if f.endswith('.pt')])
-        total_batches = len(batch_files)
+        base_dataloader = torch.utils.data.DataLoader(
+            base_dataset,
+            batch_size=self.config.get("batch_size", 64),
+            shuffle=False,
+            num_workers=self.config.get("workers", 4),
+            pin_memory=True,
+            drop_last=False,
+            collate_fn=loader[0].collate_fn,
+        )
         
-        print(f"Loading {total_batches} cached episodes from {cache_dir} into memory...")
+        global_features = {}
+        all_indices = []
         
-        cached_data = []
-        for batch_file in tqdm(batch_files, desc=f"Loading {split_name} features"):
-            file_path = os.path.join(cache_dir, batch_file)
-            features, targets = torch.load(file_path, map_location='cpu')
-            cached_data.append((features, targets))
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(tqdm(base_dataloader, desc=f"Extracting {split_name} features")):
+                images = batch[0].to(self.device)
+                raw_labels = batch[1]
+
+                if images.dim() == 5:
+                    images = images.view(-1, images.size(-3), images.size(-2), images.size(-1))
+                if torch.is_tensor(raw_labels):
+                    labels = raw_labels.view(-1)
+                elif isinstance(raw_labels, (list, tuple)) and torch.is_tensor(raw_labels[0]):
+                    labels = raw_labels[0].view(-1)
+                else:
+                    labels = raw_labels
+
+                features = self.model.emb_func(images)
+                features = features.view(features.size(0), -1).cpu()
+
+                start_idx = batch_idx * base_dataloader.batch_size
+                for i, (feat, label) in enumerate(zip(features, labels)):
+                    global_idx = start_idx + i
+                    global_features[global_idx] = {
+                        'feature': feat,
+                        'label': label.item() if torch.is_tensor(label) else label
+                    }
+                    all_indices.append(global_idx)
         
-        print(f"Done! Loaded {len(cached_data)} episodes into memory.")
+        del images, features
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        return {"dir": cache_dir, "len": total_batches, "data": cached_data}
+        total_images = len(global_features)
+        print(f"Extracted features for {total_images} unique images")
+        
+        sampler = loader[0].batch_sampler.sampler if hasattr(loader[0], 'batch_sampler') else loader[0].sampler
+        
+        collate_fn = loader[0].collate_fn
+        
+        episode_num = len(sampler)
+        
+        episode_size = self.config["episode_size"]
+        num_batches = episode_num // episode_size
+        
+        print(f"Building {num_batches} episode batches from global features...")
+        
+        cached_batches = []
+        batch_idx = 0
+        
+        for episode_indices in tqdm(sampler, total=episode_num, desc=f"Building {split_name} episodes"):
+            episode_features = []
+            episode_labels = []
+            
+            for idx in episode_indices:
+                idx_item = idx.item() if torch.is_tensor(idx) else idx
+                feat_data = global_features[idx_item]
+                episode_features.append(feat_data['feature'])
+                episode_labels.append(feat_data['label'])
+            
+            episode_features = torch.stack(episode_features)
+            episode_labels = torch.tensor(episode_labels, dtype=torch.long)
+            
+            cached_batches.append((episode_features, episode_labels))
+        
+        final_batches = []
+        for i in range(0, len(cached_batches), episode_size):
+            batch_episodes = cached_batches[i:i + episode_size]
+            if len(batch_episodes) == episode_size:
+                batch_features = torch.stack([ep[0] for ep in batch_episodes])
+                batch_labels = torch.stack([ep[1] for ep in batch_episodes])
+                final_batches.append((batch_features, batch_labels))
+        
+        del cached_batches, global_features
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        print(f"Done! Cached {len(final_batches)} batches with episode_size={episode_size}")
+        
+        return {
+            "data": final_batches,
+            "len": len(final_batches),
+            "episode_size": episode_size,
+        }
 
     def _check_data_config(self):
         """
